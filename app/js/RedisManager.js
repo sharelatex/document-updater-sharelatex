@@ -49,6 +49,55 @@ const historyKeys = Settings.redis.history.key_schema // note: this is track cha
 module.exports = RedisManager = {
   rclient,
 
+  serializeDocCore(
+    jsonLines,
+    hash,
+    jsonRanges,
+    projectId,
+    pathName,
+    projectHistoryId
+  ) {
+    return [
+      jsonLines,
+      hash,
+      jsonRanges,
+      projectId,
+      JSON.stringify(pathName),
+      String(projectHistoryId)
+    ].join('\u0000')
+  },
+
+  deserializeDocCore(blob) {
+    const [
+      docLines,
+      hash,
+      ranges,
+      projectId,
+      pathName,
+      projectHistoryId
+    ] = blob.split('\u0000')
+    return [
+      docLines,
+      hash,
+      ranges,
+      projectId,
+      JSON.parse(pathName),
+      parseInt(projectHistoryId, 10)
+    ]
+  },
+
+  serializeLastUpdatedCtx(lastUpdatedAt, lastUpdatedBy) {
+    return JSON.stringify({
+      at: lastUpdatedAt,
+      by: lastUpdatedBy || undefined
+    })
+  },
+
+  deserializeLastUpdatedCtx(blob) {
+    const { at: lastUpdatedAt, by: lastUpdatedBy } = JSON.parse(blob || '{}')
+    return { lastUpdatedAt, lastUpdatedBy }
+  },
+
   putDocInMemory(
     project_id,
     doc_id,
@@ -84,26 +133,22 @@ module.exports = RedisManager = {
         logger.error({ err: error, doc_id, project_id }, error.message)
         return callback(error)
       }
-      const multi = rclient.multi()
-      multi.set(keys.docLines({ doc_id }), docLines)
-      multi.set(keys.projectKey({ doc_id }), project_id)
-      multi.set(keys.docVersion({ doc_id }), version)
-      multi.set(keys.docHash({ doc_id }), docHash)
-      if (ranges != null) {
-        multi.set(keys.ranges({ doc_id }), ranges)
-      } else {
-        multi.del(keys.ranges({ doc_id }))
-      }
-      multi.set(keys.pathname({ doc_id }), pathname)
-      multi.set(keys.projectHistoryId({ doc_id }), projectHistoryId)
-      return multi.exec(function (error, result) {
-        if (error != null) {
-          return callback(error)
-        }
-        // update docsInProject set
-        return rclient.sadd(
-          keys.docsInProject({ project_id }),
-          doc_id,
+      // update docsInProject set before writing doc contents
+      rclient.sadd(keys.docsInProject({ project_id }), doc_id, (error) => {
+        if (error) return callback(error)
+
+        rclient.mset(
+          {
+            [keys.docCore({ doc_id })]: RedisManager.serializeDocCore(
+              docLines,
+              docHash,
+              ranges,
+              project_id,
+              pathname,
+              projectHistoryId
+            ),
+            [keys.docVersion({ doc_id })]: version
+          },
           callback
         )
       })
@@ -122,32 +167,32 @@ module.exports = RedisManager = {
       }
     }
 
-    let multi = rclient.multi()
-    multi.strlen(keys.docLines({ doc_id }))
-    multi.del(keys.docLines({ doc_id }))
-    multi.del(keys.projectKey({ doc_id }))
-    multi.del(keys.docVersion({ doc_id }))
-    multi.del(keys.docHash({ doc_id }))
-    multi.del(keys.ranges({ doc_id }))
-    multi.del(keys.pathname({ doc_id }))
-    multi.del(keys.projectHistoryId({ doc_id }))
-    multi.del(keys.projectHistoryType({ doc_id }))
-    multi.del(keys.unflushedTime({ doc_id }))
-    multi.del(keys.lastUpdatedAt({ doc_id }))
-    multi.del(keys.lastUpdatedBy({ doc_id }))
+    const multi = rclient.multi()
+    multi.get(keys.docCore({ doc_id }))
+    multi.del(
+      keys.docCore({ doc_id }),
+      keys.docVersion({ doc_id }),
+      keys.projectHistoryType({ doc_id }),
+      keys.unflushedTime({ doc_id }),
+      keys.lastUpdatedCtx({ doc_id })
+    )
     return multi.exec(function (error, response) {
       if (error != null) {
         return callback(error)
       }
-      const length = response != null ? response[0] : undefined
-      if (length > 0) {
+      const docCore = response != null ? response[0] : undefined
+      if (docCore) {
+        const [docLines] = RedisManager.deserializeDocCore(docCore)
+        const length = docLines.length
         // record bytes freed in redis
         metrics.summary('redis.docLines', length, { status: 'del' })
       }
-      multi = rclient.multi()
-      multi.srem(keys.docsInProject({ project_id }), doc_id)
-      multi.del(keys.projectState({ project_id }))
-      return multi.exec(callback)
+      // PERF: Removing the doc_id from the project and clearing the
+      //        projectState can happen independently.
+      const pipeline = rclient.pipeline()
+      pipeline.srem(keys.docsInProject({ project_id }), doc_id)
+      pipeline.del(keys.projectState({ project_id }))
+      pipeline.exec(callback)
     })
   },
 
@@ -190,30 +235,16 @@ module.exports = RedisManager = {
       ) {}
     }
     const timer = new metrics.Timer('redis.get-doc')
-    const multi = rclient.multi()
-    multi.get(keys.docLines({ doc_id }))
-    multi.get(keys.docVersion({ doc_id }))
-    multi.get(keys.docHash({ doc_id }))
-    multi.get(keys.projectKey({ doc_id }))
-    multi.get(keys.ranges({ doc_id }))
-    multi.get(keys.pathname({ doc_id }))
-    multi.get(keys.projectHistoryId({ doc_id }))
-    multi.get(keys.unflushedTime({ doc_id }))
-    multi.get(keys.lastUpdatedAt({ doc_id }))
-    multi.get(keys.lastUpdatedBy({ doc_id }))
-    return multi.exec(function (error, ...rest) {
-      let [
-        docLines,
-        version,
-        storedHash,
-        doc_project_id,
-        ranges,
-        pathname,
-        projectHistoryId,
-        unflushedTime,
-        lastUpdatedAt,
-        lastUpdatedBy
-      ] = Array.from(rest[0])
+    const _keys = [
+      keys.docCore({ doc_id }),
+      keys.docVersion({ doc_id }),
+      keys.unflushedTime({ doc_id }),
+      keys.lastUpdatedCtx({ doc_id })
+    ]
+    rclient.mget(..._keys, function (error, ...rest) {
+      let [docCore, version, unflushedTime, lastUpdatedCtx] = Array.from(
+        rest[0]
+      )
       const timeSpan = timer.done()
       if (error != null) {
         return callback(error)
@@ -225,6 +256,23 @@ module.exports = RedisManager = {
         error = new Error('redis getDoc exceeded timeout')
         return callback(error)
       }
+      if (!docCore) {
+        // doc is not in redis, bail out
+        return callback(null, null, 0, {}, null, null, null, null, null)
+      }
+      let [
+        docLines,
+        storedHash,
+        ranges,
+        doc_project_id,
+        pathname,
+        projectHistoryId
+      ] = RedisManager.deserializeDocCore(docCore)
+      const {
+        lastUpdatedAt,
+        lastUpdatedBy
+      } = RedisManager.deserializeLastUpdatedCtx(lastUpdatedCtx)
+
       // record bytes loaded from redis
       if (docLines != null) {
         metrics.summary('redis.docLines', docLines.length, { status: 'get' })
@@ -264,52 +312,17 @@ module.exports = RedisManager = {
         return callback(new Errors.NotFoundError('document not found'))
       }
 
-      if (projectHistoryId != null) {
-        projectHistoryId = parseInt(projectHistoryId)
-      }
-
-      // doc is not in redis, bail out
-      if (docLines == null) {
-        return callback(
-          null,
-          docLines,
-          version,
-          ranges,
-          pathname,
-          projectHistoryId,
-          unflushedTime,
-          lastUpdatedAt,
-          lastUpdatedBy
-        )
-      }
-
-      // doc should be in project set, check if missing (workaround for missing docs from putDoc)
-      return rclient.sadd(keys.docsInProject({ project_id }), doc_id, function (
-        error,
-        result
-      ) {
-        if (error != null) {
-          return callback(error)
-        }
-        if (result !== 0) {
-          // doc should already be in set
-          logger.error(
-            { project_id, doc_id, doc_project_id },
-            'doc missing from docsInProject set'
-          )
-        }
-        return callback(
-          null,
-          docLines,
-          version,
-          ranges,
-          pathname,
-          projectHistoryId,
-          unflushedTime,
-          lastUpdatedAt,
-          lastUpdatedBy
-        )
-      })
+      callback(
+        null,
+        docLines,
+        version,
+        ranges,
+        pathname,
+        projectHistoryId,
+        unflushedTime,
+        lastUpdatedAt,
+        lastUpdatedBy
+      )
     })
   },
 
@@ -329,18 +342,6 @@ module.exports = RedisManager = {
         return callback(null, version, projectHistoryType)
       }
     )
-  },
-
-  getDocLines(doc_id, callback) {
-    if (callback == null) {
-      callback = function (error, version) {}
-    }
-    return rclient.get(keys.docLines({ doc_id }), function (error, docLines) {
-      if (error != null) {
-        return callback(error)
-      }
-      return callback(null, docLines)
-    })
   },
 
   getPreviousDocOps(doc_id, start, end, callback) {
@@ -447,6 +448,8 @@ module.exports = RedisManager = {
     appliedOps,
     ranges,
     updateMeta,
+    pathname,
+    projectHistoryId,
     callback
   ) {
     if (appliedOps == null) {
@@ -518,19 +521,28 @@ module.exports = RedisManager = {
           return callback(error)
         }
         const multi = rclient.multi()
-        multi.set(keys.docLines({ doc_id }), newDocLines) // index 0
-        multi.set(keys.docVersion({ doc_id }), newVersion) // index 1
-        multi.set(keys.docHash({ doc_id }), newHash) // index 2
+        multi.mset({
+          [keys.docCore({ doc_id })]: RedisManager.serializeDocCore(
+            newDocLines,
+            newHash,
+            ranges,
+            project_id,
+            pathname,
+            projectHistoryId
+          ),
+          [keys.docVersion({ doc_id })]: newVersion,
+          [keys.lastUpdatedCtx({
+            doc_id
+          })]: RedisManager.serializeLastUpdatedCtx(
+            Date.now(),
+            updateMeta && updateMeta.user_id
+          )
+        })
         multi.ltrim(
           keys.docOps({ doc_id }),
           -RedisManager.DOC_OPS_MAX_LENGTH,
           -1
         ) // index 3
-        if (ranges != null) {
-          multi.set(keys.ranges({ doc_id }), ranges) // index 4
-        } else {
-          multi.del(keys.ranges({ doc_id })) // also index 4
-        }
         // push the ops last so we can get the lengths at fixed index position 7
         if (jsonOps.length > 0) {
           multi.rpush(keys.docOps({ doc_id }), ...Array.from(jsonOps)) // index 5
@@ -554,12 +566,6 @@ module.exports = RedisManager = {
           // hasn't been modified before (the content in mongo has been
           // valid up to this point). Otherwise leave it alone ("NX" flag).
           multi.set(keys.unflushedTime({ doc_id }), Date.now(), 'NX')
-          multi.set(keys.lastUpdatedAt({ doc_id }), Date.now()) // index 8
-          if (updateMeta != null ? updateMeta.user_id : undefined) {
-            multi.set(keys.lastUpdatedBy({ doc_id }), updateMeta.user_id) // index 9
-          } else {
-            multi.del(keys.lastUpdatedBy({ doc_id })) // index 9
-          }
         }
         return multi.exec(function (error, result) {
           let docUpdateCount
@@ -571,7 +577,7 @@ module.exports = RedisManager = {
             docUpdateCount = undefined // only using project history, don't bother with track-changes
           } else {
             // project is using old track-changes history service
-            docUpdateCount = result[7] // length of uncompressedHistoryOps queue (index 7)
+            docUpdateCount = result[4]
           }
 
           if (
@@ -603,16 +609,22 @@ module.exports = RedisManager = {
     return RedisManager.getDoc(project_id, doc_id, function (
       error,
       lines,
-      version
+      version,
+      ranges
     ) {
       if (error != null) {
         return callback(error)
       }
 
       if (lines != null && version != null) {
-        return rclient.set(
-          keys.pathname({ doc_id }),
+        RedisManager.putDocInMemory(
+          project_id,
+          doc_id,
+          lines,
+          version,
+          ranges,
           update.newPathname,
+          projectHistoryId,
           function (error) {
             if (error != null) {
               return callback(error)
@@ -663,7 +675,14 @@ module.exports = RedisManager = {
     }
     return async.mapSeries(
       doc_ids,
-      (doc_id, cb) => rclient.get(keys.lastUpdatedAt({ doc_id }), cb),
+      (doc_id, cb) => {
+        rclient.get(keys.lastUpdatedCtx({ doc_id }), (err, blob) => {
+          if (err || !blob) return cb(err)
+
+          const { lastUpdatedAt } = RedisManager.deserializeLastUpdatedCtx(blob)
+          cb(null, lastUpdatedAt)
+        })
+      },
       callback
     )
   },
@@ -727,13 +746,9 @@ module.exports = RedisManager = {
     if (callback == null) {
       callback = function (error, serializedRanges) {}
     }
-    let jsonRanges = JSON.stringify(ranges)
+    const jsonRanges = JSON.stringify(ranges)
     if (jsonRanges != null && jsonRanges.length > MAX_RANGES_SIZE) {
       return callback(new Error('ranges are too large'))
-    }
-    if (jsonRanges === '{}') {
-      // Most doc will have empty ranges so don't fill redis with lots of '{}' keys
-      jsonRanges = null
     }
     return callback(null, jsonRanges)
   },

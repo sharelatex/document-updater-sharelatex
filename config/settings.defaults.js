@@ -115,6 +115,9 @@ module.exports = {
         blockingKey({ doc_id: docId }) {
           return `Blocking:{${docId}}`
         },
+        docCore({ doc_id: docId }) {
+          return `docCore:{${docId}}`
+        },
         docLines({ doc_id: docId }) {
           return `doclines:{${docId}}`
         },
@@ -153,6 +156,9 @@ module.exports = {
         },
         pendingUpdates({ doc_id: docId }) {
           return `PendingUpdates:{${docId}}`
+        },
+        lastUpdatedCtx({ doc_id: docId }) {
+          return `lastUpdatedCtx:{${docId}}`
         },
         lastUpdatedBy({ doc_id: docId }) {
           return `lastUpdatedBy:{${docId}}`
